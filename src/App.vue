@@ -7,13 +7,23 @@ import { ref, computed } from "vue";
 
 // Размер холста (viewBox) и рамка диаграммы. Границы рамки — это «воздух»,
 // откуда приходят и куда уходят граничные стрелки.
-const CANVAS = { w: 1520, h: 940 };
-const FRAME = { l: 10, t: 10, r: 1510, b: 870 };
+const CANVAS = { w: 1600, h: 1000 };
+const FRAME = { l: 10, t: 10, r: 1590, b: 930 };
 
 // Корневой блок A0 — по центру. Дочерние блоки — лесенкой от левого верхнего
 // угла к правому нижнему.
 const ROOT_BLOCK = { w: 400, h: 200 };
-const CHILD_BLOCK = { w: 180, h: 90, x0: 150, y0: 110, dx: 215, dy: 120 };
+const CHILD_BLOCK = { w: 180, h: 90, x0: 190, y0: 150, dx: 215, dy: 120 };
+
+// Названия стрелок
+const MAX_NAME_LEN = 40;
+const LABEL_CHAR_W = 6.8; // примерная ширина символа при font-size 12
+const DEFAULT_ROOT_NAMES = {
+  I: "Входные данные",
+  C: "Регламент",
+  O: "Результат",
+  M: "Исполнитель",
+};
 
 // Правило IDEF0: декомпозиция содержит от 3 до 6 блоков.
 const MIN_CHILD_BLOCKS = 3;
@@ -31,12 +41,14 @@ const SIDE_BY_TYPE = { I: "L", C: "T", O: "R", M: "B" };
      <id блока> — дочерняя диаграмма, на которую декомпозирован этот блок.
    Привязка дочернего листа к родительскому блоку — это сам ключ + parentKey.
 
-   Стрелки диаграммы (без каких-либо текстовых данных):
-     { id, kind: 'internal', fromId, toId, port: 'I' | 'C' }
+   Стрелки диаграммы:
+     { id, kind: 'internal', fromId, toId, port: 'I' | 'C', name }
          между блоками: правая грань источника → левая (I) или верхняя (C) грань приёмника
-     { id, kind: 'boundary', type: 'I'|'C'|'O'|'M', blockId, parentKey, tunnel }
+     { id, kind: 'boundary', type: 'I'|'C'|'O'|'M', blockId, parentKey, tunnel, name }
          граничная: parentKey — стрелка родителя (унаследована) или null;
          tunnel = true — тоннельная (на родителе её нет)
+   Название унаследованной стрелки всегда берётся у родителя: на родительской
+   и дочерней диаграммах она называется одинаково.
    ========================================================================== */
 
 const diagramType = ref("AS-IS");
@@ -122,6 +134,15 @@ const removeDiagram = (key) => {
   delete diagrams.value[key];
 };
 
+// Название стрелки в диаграмме key. Унаследованная стрелка называется так же,
+// как стрелка родителя, поэтому имя ищется вверх по иерархии.
+const resolveName = (key, a) => {
+  if (a.kind === "boundary" && a.parentKey !== null) {
+    return getInherited(key).find((i) => i.key === a.parentKey)?.name ?? "";
+  }
+  return a.name || "";
+};
+
 // Стрелки, которые родительская диаграмма «передаёт» дочерней:
 // все стрелки, подключённые к блоку-родителю на листе выше.
 const getInherited = (key) => {
@@ -132,13 +153,15 @@ const getInherited = (key) => {
 
   const raw = [];
   for (const a of parent.arrows) {
+    let type = null;
     if (a.kind === "internal") {
       if (a.toId === key)
-        raw.push({ key: a.id, type: a.port }); // вход или управление
-      else if (a.fromId === key) raw.push({ key: a.id, type: "O" }); // выход
+        type = a.port; // вход или управление
+      else if (a.fromId === key) type = "O"; // выход
     } else if (a.blockId === key) {
-      raw.push({ key: a.id, type: a.type });
+      type = a.type;
     }
+    if (type) raw.push({ key: a.id, type, name: resolveName(d.parentKey, a) });
   }
   raw.sort((p, q) => p.key - q.key);
 
@@ -186,7 +209,14 @@ const normalize = () => {
    БЛОКИ
    ========================================================================== */
 
-const pushBoundary = (d, type, blockId, parentKey = null, tunnel = false) => {
+const pushBoundary = (
+  d,
+  type,
+  blockId,
+  parentKey = null,
+  tunnel = false,
+  name = "",
+) => {
   d.arrows.push({
     id: arrowSeq++,
     kind: "boundary",
@@ -194,6 +224,7 @@ const pushBoundary = (d, type, blockId, parentKey = null, tunnel = false) => {
     blockId,
     parentKey,
     tunnel,
+    name,
   });
 };
 
@@ -209,7 +240,9 @@ const addBlock = () => {
 
   // Для A0 сразу создаём четыре граничные стрелки — их можно изменить или удалить.
   if (isRoot.value) {
-    ["I", "C", "O", "M"].forEach((t) => pushBoundary(d, t, block.id));
+    ["I", "C", "O", "M"].forEach((t) =>
+      pushBoundary(d, t, block.id, null, false, DEFAULT_ROOT_NAMES[t]),
+    );
   }
 
   normalize();
@@ -305,6 +338,46 @@ const decomposeSelected = () => {
   goTo(b.id);
 };
 
+const countBlocks = (key) => {
+  const d = diagrams.value[key];
+  return d ? d.blocks.reduce((n, b) => n + 1 + countBlocks(b.id), 0) : 0;
+};
+
+// Удаляет дочернюю диаграмму блока (с вложенными диаграммами). Сам блок
+// и его стрелки на родительской диаграмме остаются.
+const deleteDiagram = (key) => {
+  const d = diagrams.value[key];
+  if (!d || key === "root") return;
+  const owner = findBlock(key);
+  const text =
+    `Удалить дочернюю диаграмму блока ${owner?.code ?? ""}?\n` +
+    `Будут удалены все её блоки и стрелки (всего блоков: ${countBlocks(key)}), включая вложенные диаграммы. ` +
+    `Сам блок ${owner?.code ?? ""} останется.`;
+  if (!confirm(text)) return;
+
+  if (currentKey.value === key) {
+    currentKey.value = d.parentKey;
+    selectedId.value = key; // id блока совпадает с ключом его диаграммы
+  }
+  removeDiagram(key);
+  normalize();
+  showNotice(`Дочерняя диаграмма блока ${owner?.code ?? ""} удалена.`);
+};
+
+/* ==========================================================================
+   УВЕДОМЛЕНИЯ
+   ========================================================================== */
+
+const notice = ref("");
+let noticeTimer = null;
+const showNotice = (text) => {
+  notice.value = text;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => {
+    notice.value = "";
+  }, 5000);
+};
+
 /* ==========================================================================
    СТРЕЛКИ: меню создания / редактирования
    ========================================================================== */
@@ -335,6 +408,19 @@ const form = ref({
   parentKey: null,
   blockId: null,
   type: "I",
+  name: "",
+});
+
+// Название выбранной стрелки родителя — показывается в форме только для чтения
+const inheritedFormName = computed(
+  () => inheritedMap.value.get(form.value.parentKey)?.name ?? "",
+);
+
+// Для входов и выходов действует правило замены стрелки с тем же названием
+const replacesSameName = computed(() => {
+  const f = form.value;
+  if (f.kind === "internal") return f.port === "I";
+  return f.type === "I" || f.type === "O";
 });
 
 const availableKinds = computed(() => {
@@ -387,9 +473,11 @@ const openArrowModal = (arrow = null) => {
     parentKey: firstInh,
     blockId: defaultBlock,
     type: "I",
+    name: "",
   };
 
   if (arrow) {
+    form.value.name = arrow.name || "";
     if (arrow.kind === "internal") {
       Object.assign(form.value, {
         kind: "internal",
@@ -434,7 +522,9 @@ const saveArrow = () => {
   const fail = (msg) => {
     arrowModal.value.error = msg;
   };
+  const name = f.name.trim().slice(0, MAX_NAME_LEN);
   let record;
+  let effectiveName = name;
 
   if (f.kind === "internal") {
     const fromId = Number(f.fromId);
@@ -450,7 +540,7 @@ const saveArrow = () => {
         a.port === f.port,
     );
     if (duplicate) return fail("Такая стрелка уже есть на диаграмме.");
-    record = { kind: "internal", fromId, toId, port: f.port };
+    record = { kind: "internal", fromId, toId, port: f.port, name };
   } else if (f.kind === "inherited") {
     const inh = inheritedMap.value.get(f.parentKey);
     if (!inh) return fail("Выберите стрелку родителя.");
@@ -470,7 +560,9 @@ const saveArrow = () => {
       blockId,
       parentKey: inh.key,
       tunnel: false,
+      name: "",
     };
+    effectiveName = inh.name;
   } else if (f.kind === "tunnel") {
     record = {
       kind: "boundary",
@@ -478,6 +570,7 @@ const saveArrow = () => {
       blockId: Number(f.blockId),
       parentKey: null,
       tunnel: true,
+      name,
     };
   } else {
     record = {
@@ -486,18 +579,53 @@ const saveArrow = () => {
       blockId: Number(f.blockId),
       parentKey: null,
       tunnel: false,
+      name,
     };
   }
 
+  // Правило: вход или выход с таким же названием заменяет старый.
+  // Сравниваются стрелки одного вида: граничные входы, граничные выходы
+  // и внутренние стрелки-входы. Подключения одной и той же стрелки родителя
+  // к разным блокам (ветвление) не считаются дубликатами.
+  const dupClass = (r) =>
+    r.kind === "internal"
+      ? r.port === "I"
+        ? "internal-I"
+        : null
+      : r.type === "I" || r.type === "O"
+        ? `boundary-${r.type}`
+        : null;
+  const cls = dupClass(record);
+  const wanted = effectiveName.toLowerCase();
+  let replaced = 0;
+
+  if (cls && wanted) {
+    const before = d.arrows.length;
+    d.arrows = d.arrows.filter((a) => {
+      if (a.id === editing) return true;
+      if (dupClass(a) !== cls) return true;
+      if (record.parentKey != null && a.parentKey === record.parentKey)
+        return true;
+      return resolveName(currentKey.value, a).trim().toLowerCase() !== wanted;
+    });
+    replaced = before - d.arrows.length;
+  }
+
+  const target = currentDiagram.value;
   if (editing !== null) {
-    const idx = d.arrows.findIndex((a) => a.id === editing);
-    if (idx !== -1) d.arrows[idx] = { id: editing, ...record };
+    const idx = target.arrows.findIndex((a) => a.id === editing);
+    if (idx !== -1) target.arrows[idx] = { id: editing, ...record };
   } else {
-    d.arrows.push({ id: arrowSeq++, ...record });
+    target.arrows.push({ id: arrowSeq++, ...record });
   }
 
   normalize();
   arrowModal.value.open = false;
+  if (replaced) {
+    showNotice(
+      `Стрелка с названием «${effectiveName}» уже была — старая заменена новой.`,
+    );
+  }
 };
 
 const deleteArrow = (id) => {
@@ -619,6 +747,45 @@ const ports = computed(() => {
   return result;
 });
 
+// Подпись ставится на самый длинный отрезок стрелки: над горизонтальным
+// или повёрнутой вдоль вертикального. Если названию не хватает места,
+// оно сокращается многоточием; полное название видно во всплывающей подсказке.
+// trimStart / trimEnd оставляют место под тоннельные скобки у границы.
+const labelFor = (pts, name, trimStart = 0, trimEnd = 0) => {
+  if (!name) return null;
+  const work = pts.map((p) => [...p]);
+  const shorten = (a, b, by) => {
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (len <= by) return;
+    a[0] += ((b[0] - a[0]) / len) * by;
+    a[1] += ((b[1] - a[1]) / len) * by;
+  };
+  if (trimStart) shorten(work[0], work[1], trimStart);
+  if (trimEnd) shorten(work[work.length - 1], work[work.length - 2], trimEnd);
+
+  let best = null;
+  for (let i = 0; i < work.length - 1; i++) {
+    const [x1, y1] = work[i];
+    const [x2, y2] = work[i + 1];
+    const len = Math.abs(x2 - x1) + Math.abs(y2 - y1);
+    if (!best || len > best.len + 0.5) {
+      best = {
+        len,
+        vertical: Math.abs(x2 - x1) < 0.5,
+        x: (x1 + x2) / 2,
+        y: (y1 + y2) / 2,
+      };
+    }
+  }
+
+  const max = Math.floor((best.len - 14) / LABEL_CHAR_W);
+  if (max < 3) return null;
+  const text = name.length > max ? name.slice(0, max - 1) + "…" : name;
+  return best.vertical
+    ? { x: best.x - 6, y: best.y, rotate: true, text }
+    : { x: best.x, y: best.y - 6, rotate: false, text };
+};
+
 /*
   Маршруты. Блоки стоят лесенкой, поэтому «вперёд» (индекс приёмника больше)
   всегда значит «вправо и вниз», и линии не пересекают чужие блоки:
@@ -717,10 +884,21 @@ const arrowShapes = computed(() => {
       if (!a.tunnel) tunnel = null;
     }
 
+    const name =
+      a.kind === "boundary" && a.parentKey !== null
+        ? (inheritedMap.value.get(a.parentKey)?.name ?? "")
+        : a.name || "";
+    // Тоннельные скобки стоят у границы: подпись смещаем от них
+    const trimStart =
+      tunnel && !(a.kind === "boundary" && a.type === "O") ? 44 : 0;
+    const trimEnd = tunnel && a.kind === "boundary" && a.type === "O" ? 44 : 0;
+
     return [
       {
         id: a.id,
         arrow: a,
+        name,
+        label: labelFor(pts, name, trimStart, trimEnd),
         d: "M " + pts.map((p) => `${p[0]} ${p[1]}`).join(" L "),
         tunnel,
       },
@@ -736,9 +914,11 @@ const idxOf = (id) => currentBlocks.value.findIndex((b) => b.id === id);
 
 const describeArrow = (a) => {
   const code = (id) => findBlock(id)?.code ?? "?";
+  const name = resolveName(currentKey.value, a);
   if (a.kind === "internal") {
     const back = idxOf(a.toId) < idxOf(a.fromId);
     return {
+      name,
       title: `${code(a.fromId)} → ${code(a.toId)}`,
       sub: `Выход → ${a.port === "I" ? "Вход" : "Управление"}${back ? ", обратная связь" : ""}`,
     };
@@ -748,7 +928,11 @@ const describeArrow = (a) => {
   if (a.tunnel) sub += ", тоннель";
   else if (a.parentKey !== null)
     sub += `, ${inheritedMap.value.get(a.parentKey)?.code ?? ""} от родителя`;
-  return { title: a.type === "O" ? `${b} → граница` : `граница → ${b}`, sub };
+  return {
+    name,
+    title: a.type === "O" ? `${b} → граница` : `граница → ${b}`,
+    sub,
+  };
 };
 
 const arrowItems = computed(() =>
@@ -766,7 +950,9 @@ const issues = computed(() => {
     const d = diagrams.value[key];
     if (!d) return;
     const where = diagramLabel(key);
-    const push = (text) => out.push({ key, where, text });
+    const push = (text, level = "error") =>
+      out.push({ key, where, text, level });
+    const code = (id) => findBlock(id)?.code ?? "?";
 
     if (key === "root") {
       if (!d.blocks.length) push("На контекстной диаграмме нет блока A0.");
@@ -777,6 +963,18 @@ const issues = computed(() => {
       push(
         `Блоков на диаграмме: ${d.blocks.length}. Декомпозиция должна содержать от ${MIN_CHILD_BLOCKS} до ${MAX_CHILD_BLOCKS}.`,
       );
+    }
+
+    // Стрелки без названия (унаследованные берут название у родителя)
+    for (const a of d.arrows) {
+      if (a.kind === "boundary" && a.parentKey !== null) continue;
+      if (!(a.name || "").trim()) {
+        const who =
+          a.kind === "internal"
+            ? `${code(a.fromId)} → ${code(a.toId)}`
+            : `${TYPE_NAMES[a.type].toLowerCase()} у блока ${code(a.blockId)}`;
+        push(`Стрелка без названия: ${who}.`, "warning");
+      }
     }
 
     for (const b of d.blocks) {
@@ -799,11 +997,26 @@ const issues = computed(() => {
         .filter((a) => a.kind === "boundary" && a.parentKey !== null)
         .map((a) => a.parentKey),
     );
-    for (const inh of getInherited(key)) {
-      if (!bound.has(inh.key)) {
-        push(
-          `Унаследованная стрелка ${inh.code} (${TYPE_NAMES[inh.type].toLowerCase()}) не подключена ни к одному блоку.`,
-        );
+    // Баланс: сколько стрелок каждого типа у родительского блока,
+    // столько же должно прийти на дочернюю диаграмму.
+    if (key !== "root") {
+      const plural = {
+        I: "входов",
+        C: "управлений",
+        O: "выходов",
+        M: "механизмов",
+      };
+      const parentCode = code(key);
+      const inherited = getInherited(key);
+      for (const type of ["I", "C", "O", "M"]) {
+        const expected = inherited.filter((i) => i.type === type);
+        const missing = expected.filter((i) => !bound.has(i.key));
+        if (missing.length) {
+          push(
+            `Не совпадает число ${plural[type]}: у блока ${parentCode} — ${expected.length}, ` +
+              `на диаграмме — ${expected.length - missing.length} (не подключены: ${missing.map((m) => m.code).join(", ")}).`,
+          );
+        }
       }
     }
 
@@ -814,6 +1027,9 @@ const issues = computed(() => {
   return out;
 });
 
+const errorCount = computed(
+  () => issues.value.filter((i) => i.level === "error").length,
+);
 const validationOpen = ref(false);
 </script>
 
@@ -874,15 +1090,23 @@ const validationOpen = ref(false);
           @click="validationOpen = true"
           class="px-3 py-1.5 border rounded text-sm font-medium transition flex items-center gap-2"
           :class="
-            issues.length
+            errorCount
               ? 'border-red-300 bg-red-50 text-red-700 hover:bg-red-100'
-              : 'border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+              : issues.length
+                ? 'border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100'
+                : 'border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
           "
         >
           Проверить диаграмму
           <span
             class="inline-block min-w-[1.25rem] text-center rounded-full text-xs font-bold px-1.5 py-0.5 text-white"
-            :class="issues.length ? 'bg-red-600' : 'bg-emerald-600'"
+            :class="
+              errorCount
+                ? 'bg-red-600'
+                : issues.length
+                  ? 'bg-amber-500'
+                  : 'bg-emerald-600'
+            "
             >{{ issues.length }}</span
           >
         </button>
@@ -992,6 +1216,7 @@ const validationOpen = ref(false);
             @mouseenter="hoveredArrowId = s.id"
             @mouseleave="hoveredArrowId = null"
           >
+            <title v-if="s.name">{{ s.name }}</title>
             <path :d="s.d" fill="none" stroke="transparent" stroke-width="16" />
             <path
               :d="s.d"
@@ -1015,6 +1240,25 @@ const validationOpen = ref(false);
               <path d="M -4 -9 Q -12 0 -4 9" />
               <path d="M 4 -9 Q 12 0 4 9" />
             </g>
+            <!-- Название стрелки -->
+            <text
+              v-if="s.label"
+              :x="s.label.x"
+              :y="s.label.y"
+              :transform="
+                s.label.rotate ? `rotate(-90 ${s.label.x} ${s.label.y})` : null
+              "
+              text-anchor="middle"
+              font-size="12"
+              font-weight="600"
+              paint-order="stroke"
+              stroke="#fff"
+              stroke-width="4"
+              stroke-linejoin="round"
+              :fill="hoveredArrowId === s.id ? '#2563eb' : '#334155'"
+            >
+              {{ s.label.text }}
+            </text>
           </g>
 
           <!-- Блоки -->
@@ -1069,6 +1313,21 @@ const validationOpen = ref(false);
             </text>
           </g>
         </svg>
+
+        <div
+          v-if="notice"
+          role="status"
+          class="absolute bottom-4 left-1/2 -translate-x-1/2 bg-slate-900 text-white text-sm px-4 py-2 rounded shadow-lg flex items-center gap-3 z-20"
+        >
+          <span>{{ notice }}</span>
+          <button
+            @click="notice = ''"
+            class="text-slate-300 hover:text-white"
+            aria-label="Закрыть"
+          >
+            ✕
+          </button>
+        </div>
       </main>
 
       <!-- БОКОВАЯ ПАНЕЛЬ -->
@@ -1100,6 +1359,13 @@ const validationOpen = ref(false);
                     ? "Открыть дочернюю диаграмму"
                     : "Создать дочернюю диаграмму"
                 }}
+              </button>
+              <button
+                v-if="diagrams[selectedBlock.id]"
+                @click="deleteDiagram(selectedBlock.id)"
+                class="px-3 py-1.5 border border-red-300 text-red-700 hover:bg-red-50 rounded font-medium transition"
+              >
+                Удалить дочернюю диаграмму
               </button>
               <button
                 @click="deleteSelectedBlock"
@@ -1152,6 +1418,12 @@ const validationOpen = ref(false);
           >
             Подключить автоматически ({{ unboundInherited.length }})
           </button>
+          <button
+            @click="deleteDiagram(currentKey)"
+            class="mt-3 w-full px-3 py-1.5 border border-red-300 text-red-700 hover:bg-red-50 rounded font-medium transition"
+          >
+            Удалить эту диаграмму
+          </button>
         </section>
 
         <section class="p-4 border-b border-slate-200">
@@ -1168,8 +1440,14 @@ const validationOpen = ref(false);
                 class="w-full text-left px-2 py-1.5 rounded transition hover:bg-blue-50"
                 :class="hoveredArrowId === it.arrow.id ? 'bg-blue-50' : ''"
               >
-                <span class="font-medium text-slate-900">{{ it.title }}</span>
-                <span class="block text-xs text-slate-500">{{ it.sub }}</span>
+                <span
+                  class="font-medium break-words"
+                  :class="it.name ? 'text-slate-900' : 'text-slate-400 italic'"
+                  >{{ it.name || "Без названия" }}</span
+                >
+                <span class="block text-xs text-slate-500"
+                  >{{ it.title }} · {{ it.sub }}</span
+                >
               </button>
             </li>
           </ul>
@@ -1273,6 +1551,36 @@ const validationOpen = ref(false);
         </div>
 
         <div class="space-y-4 text-sm">
+          <!-- Название стрелки -->
+          <div v-if="form.kind !== 'inherited'">
+            <label class="block text-slate-600 mb-1">Название стрелки</label>
+            <input
+              v-model="form.name"
+              type="text"
+              :maxlength="MAX_NAME_LEN"
+              @keyup.enter="saveArrow"
+              placeholder="например, Заявка клиента"
+              class="w-full bg-slate-50 border border-slate-300 rounded p-2 text-slate-900 focus:outline-none focus:border-blue-600"
+            />
+            <p v-if="replacesSameName" class="text-xs text-slate-500 mt-1">
+              Вход или выход с таким же названием заменит уже существующий.
+            </p>
+          </div>
+          <div v-else>
+            <span class="block text-slate-600 mb-1">Название стрелки</span>
+            <p
+              class="bg-slate-100 border border-slate-200 rounded p-2"
+              :class="
+                inheritedFormName ? 'text-slate-900' : 'text-slate-400 italic'
+              "
+            >
+              {{ inheritedFormName || "Без названия" }}
+            </p>
+            <p class="text-xs text-slate-500 mt-1">
+              Название задаётся на родительской диаграмме и совпадает на обеих.
+            </p>
+          </div>
+
           <!-- Между блоками -->
           <template v-if="form.kind === 'internal'">
             <div class="grid grid-cols-2 gap-3">
@@ -1435,11 +1743,17 @@ const validationOpen = ref(false);
         </h2>
         <p
           class="text-sm mb-4"
-          :class="issues.length ? 'text-red-700' : 'text-emerald-700'"
+          :class="
+            errorCount
+              ? 'text-red-700'
+              : issues.length
+                ? 'text-amber-700'
+                : 'text-emerald-700'
+          "
         >
           {{
             issues.length
-              ? `Найдено замечаний: ${issues.length}`
+              ? `Ошибок: ${errorCount}, предупреждений: ${issues.length - errorCount}`
               : "Замечаний нет. Диаграммы соответствуют правилам."
           }}
         </p>
@@ -1447,10 +1761,16 @@ const validationOpen = ref(false);
           <li
             v-for="(it, i) in issues"
             :key="i"
-            class="border border-slate-200 rounded p-3 flex justify-between items-start gap-3"
+            class="border rounded p-3 flex justify-between items-start gap-3"
+            :class="
+              it.level === 'error' ? 'border-red-200' : 'border-amber-200'
+            "
           >
             <div>
-              <p class="text-xs text-slate-500">{{ it.where }}</p>
+              <p class="text-xs text-slate-500">
+                {{ it.level === "error" ? "Ошибка" : "Предупреждение" }} ·
+                {{ it.where }}
+              </p>
               <p class="text-slate-900">{{ it.text }}</p>
             </div>
             <button
